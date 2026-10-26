@@ -389,11 +389,13 @@ export const register: Register = on => {
     return next(e)
   }).catch(($, e, next) => next(e))
 
-  // The transcript shows one line per handoff; the model still reads it whole, and ctrl+o shows all.
+  // The transcript shows one line per handoff; the model still reads it whole. Unlike the
+  // tool rows this one ignores isExpanded: a plugin's message whose body fits under its
+  // speaker label arrives expanded in the normal view too. The sender's ctrl+o shows it all.
   on('ui.render', { component: 'UserMessage' }, async ($, e, next) => {
-    const { origin, text, isExpanded } = e.props
+    const { origin, text } = e.props
     const found = /\[relevo\] (\w+) de la sesión que (planifica|construye)/.exec(text)
-    if (isExpanded || origin.kind !== 'plugin' || origin.name !== 'relevo' || found === null) return next(e)
+    if (origin.kind !== 'plugin' || origin.name !== 'relevo' || found === null) return next(e)
     return next({ ...e, props: { ...e.props, text: `📥 ${found[1]} recibido de la sesión que ${found[2]}` } })
   }).catch(($, e, next) => next(e))
 

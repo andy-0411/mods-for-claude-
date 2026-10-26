@@ -190,7 +190,7 @@ test('the pane shows both sessions and spins for the busy one', async ($, on) =>
   await ui.unmount()
 })
 
-test('the transcript shows one line per handoff, and everything when expanded', async ($, on) => {
+test('the transcript shows one line per handoff', async ($, on) => {
   mock.clock(on, { now: Date.now() })
   stubEngine(on)
   // The engine's own drawing of a row the plugin passes on: its text, or the call's input.
@@ -212,9 +212,11 @@ test('the transcript shows one line per handoff, and everything when expanded', 
   expect(await short.find({ type: 'Text', text: /📥 plan recibido de la sesión que planifica/ })).toBeDefined()
   expect(await short.find({ type: 'Text', text: /Paso 1 largo/ })).toBeUndefined()
   await short.unmount()
-  const full = await $.ui.mount(message(true) as any)
-  expect(await full.find({ type: 'Text', text: /Paso 1 largo/ })).toBeDefined()
-  await full.unmount()
+  // A body that fits under the speaker label comes expanded in the normal view: still one line.
+  const fits = await $.ui.mount(message(true) as any)
+  expect(await fits.find({ type: 'Text', text: /📥 plan recibido/ })).toBeDefined()
+  expect(await fits.find({ type: 'Text', text: /Paso 1 largo/ })).toBeUndefined()
+  await fits.unmount()
 
   const call = await $.ui.mount({
     plugin: 'relevo',

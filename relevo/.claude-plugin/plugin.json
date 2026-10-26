@@ -1,6 +1,6 @@
 {
   "name": "relevo",
-  "version": "0.3.1",
+  "version": "0.3.2",
   "description": "Dos sesiones de Claude se pasan el trabajo: una planifica y revisa, la otra construye",
   "author": { "name": "Andres Varon" },
   "types": "./types/index.d.ts"
