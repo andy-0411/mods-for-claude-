@@ -177,6 +177,7 @@ export const register: Register = on => {
     const startedAt = Date.now()
     const row: AgentRow = {
       toolUseId: e.tool_use_id,
+      name: e.name,
       type: e.subagentType,
       model: e.model ?? 'inherit',
       description: e.description || e.prompt.slice(0, 60),
@@ -204,6 +205,8 @@ export const register: Register = on => {
     await patch($, isRow, one => ({
       ...one,
       agentId: started.agentId,
+      // A teammate's address is `<name>@<team>`: its name may carry a suffix (`scout-2`).
+      name: started.teammateId?.split('@')[0] ?? one.name,
       model: shortModel(started.model),
       status: one.status === 'arrancando' ? 'corriendo' : one.status,
     }))
@@ -326,7 +329,10 @@ export const register: Register = on => {
     const Card = (row: AgentRow) => {
       const isDone = !isActive(row)
       const color = STATUS_COLOR[row.status]
-      const doing = isDone ? row.description : `${row.lastTool ?? 'pensando'} · ${row.description}`
+      // Unnamed, the task names the card and is not repeated under it.
+      const title = row.name ?? row.description
+      const activity = isDone ? 'terminado' : row.lastTool ?? 'pensando'
+      const doing = row.name === undefined ? activity : isDone ? row.description : `${activity} · ${row.description}`
       const detail =
         row.status === 'esperando' ? ` · ${row.waitingTool ?? ''}` : row.status === 'corriendo' ? ` · ${row.lastTool ?? 'pensando'}` : ''
       return (
@@ -341,7 +347,7 @@ export const register: Register = on => {
         >
           <Box flexDirection="row">
             <Box flexGrow={1} flexShrink={1}>
-              <Text bold dimColor={isDone} wrap="truncate-end">{shortType(row.type)}</Text>
+              <Text bold dimColor={isDone} wrap="truncate-end">{title}</Text>
             </Box>
             <Box flexShrink={0} marginLeft={1}>
               <Text dimColor={isDone}>
@@ -349,8 +355,8 @@ export const register: Register = on => {
               </Text>
             </Box>
           </Box>
-          <Text dimColor={isDone} wrap="truncate-end">
-            {`${row.model} · ${tokens(spent(row))} tok · ${row.requests} req · ${row.toolCount} tools`}
+          <Text dimColor wrap="truncate-end">
+            {`${shortType(row.type)} · ${row.model} · ${tokens(spent(row))} tok · ${row.requests} req · ${row.toolCount} tools`}
           </Text>
           <Text dimColor wrap="truncate-end">{doing}</Text>
           <Text color={color} wrap="truncate-end">{loadBar(row, at, cells)}</Text>

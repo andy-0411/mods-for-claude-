@@ -3,6 +3,8 @@ export type AgentStatus = 'arrancando' | 'corriendo' | 'esperando' | 'listo' | '
 export type AgentRow = {
   toolUseId: string
   agentId?: string
+  /** The name the call gave it (`Agent({ name })`), with the team's suffix if it got one. */
+  name?: string
   type: string
   model: string
   description: string

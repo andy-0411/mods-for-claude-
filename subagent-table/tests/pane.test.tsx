@@ -48,9 +48,10 @@ test('a spawned subagent shows as a running row in a wide pane', async ($, on) =
 
   for (const surface of ['terminal', 'desktop'] as const) {
     const ui = await $.ui.mount({ ...PANE, surface })
-    expect((await ui.find({ type: 'Text', text: /^sonnet-implementer$/ }))?.text).toBe('sonnet-implementer')
-    expect((await ui.find({ type: 'Text', text: /^sonnet-5-5 · / }))?.text).toBe('sonnet-5-5 · 0 tok · 0 req · 0 tools')
-    expect((await ui.find({ type: 'Text', text: /Buscar config/ }))?.text).toBe('pensando · Buscar config')
+    // Unnamed, the task is the card's title and the line under it says what it does.
+    expect((await ui.find({ type: 'Text', text: /Buscar config/ }))?.props.bold).toBe(true)
+    expect((await ui.find({ type: 'Text', text: /^sonnet-implementer · / }))?.text).toBe('sonnet-implementer · sonnet-5-5 · 0 tok · 0 req · 0 tools')
+    expect((await ui.find({ type: 'Text', text: /^pensando$/ }))?.text).toBe('pensando')
     expect((await ui.find({ type: 'Text', text: /● trabajando/ }))?.text).toBe(' ● trabajando · pensando')
     await ui.unmount()
   }
@@ -77,7 +78,7 @@ test('a narrow pane draws cards with the tokens each request cost', async ($, on
   for (const surface of ['terminal', 'desktop'] as const) {
     const ui = await $.ui.mount({ ...PANE, surface, props: { ...PANE.props, bodyColumns: 40 } })
     // Two requests of 1200 + 500 fresh in and 800 out: 5000 tokens, 60k cached.
-    expect((await ui.find({ type: 'Text', text: /tok · 2 req/ }))?.text).toBe('sonnet-5-5 · 5.0k tok · 2 req · 0 tools')
+    expect((await ui.find({ type: 'Text', text: /tok · 2 req/ }))?.text).toBe('Explore · sonnet-5-5 · 5.0k tok · 2 req · 0 tools')
     expect((await ui.find({ type: 'Text', text: /caché/ }))?.text).toBe('0s · 5.0k tok (+60k caché)')
     await ui.unmount()
   }
@@ -178,4 +179,26 @@ test('the permission verdict goes up untouched', async ($, on) => {
 
   await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
   expect(await $.tool.check({ tool: 'Bash', input: { command: 'ls' } })).toEqual({ decision: 'ask', reason: 'Bash pide permiso' })
+})
+
+test('a named subagent shows its name as the title, the task under it', async ($, on) => {
+  on('command.register', () => ({ value: { command: 'subagentes' } }))
+  on('ui.open', () => ({ value: { isPlaced: true } }))
+  on('ui.status', () => ({ value: undefined }))
+  on('session.start', (_, e) => ({ cwd: e.cwd }))
+  let id = 0
+  on('agent.spawn', () => ({ model: 'claude-sonnet-5-5', agentId: `a${++id}` }))
+
+  await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
+  await $.agent.spawn({ ...SPAWN, prompt: 'Explora el repo', description: 'Explorar repo', name: 'scout', subagentType: 'Explore' })
+  await $.agent.spawn({ ...SPAWN, tool_use_id: 'tu2', prompt: 'Lee el README', description: 'Leer README', subagentType: 'Explore' })
+
+  for (const surface of ['terminal', 'desktop'] as const) {
+    const ui = await $.ui.mount({ ...PANE, surface })
+    expect((await ui.find({ type: 'Text', text: /^scout$/ }))?.props.bold).toBe(true)
+    // Unnamed, its task is the title.
+    expect((await ui.find({ type: 'Text', text: /^Leer README$/ }))?.props.bold).toBe(true)
+    expect((await ui.find({ type: 'Text', text: /Explorar repo/ }))?.text).toBe('pensando · Explorar repo')
+    await ui.unmount()
+  }
 })
