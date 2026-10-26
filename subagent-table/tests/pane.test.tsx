@@ -49,10 +49,9 @@ test('a spawned subagent shows as a running row in a wide pane', async ($, on) =
   for (const surface of ['terminal', 'desktop'] as const) {
     const ui = await $.ui.mount({ ...PANE, surface })
     expect((await ui.find({ type: 'Text', text: /^sonnet-implementer$/ }))?.text).toBe('sonnet-implementer')
-    expect((await ui.find({ type: 'Text', text: /^sonnet-5-5$/ }))?.text).toBe('sonnet-5-5')
-    expect((await ui.find({ type: 'Text', text: /^corriendo$/ }))?.text).toBe('corriendo')
-    expect((await ui.find({ type: 'Text', text: /^Tokens$/ }))?.text).toBe('Tokens')
-    expect((await ui.find({ type: 'Text', text: /Buscar config/ }))?.text).toBe('Buscar config')
+    expect((await ui.find({ type: 'Text', text: /^sonnet-5-5 · / }))?.text).toBe('sonnet-5-5 · 0 tok · 0 req · 0 tools')
+    expect((await ui.find({ type: 'Text', text: /Buscar config/ }))?.text).toBe('pensando · Buscar config')
+    expect((await ui.find({ type: 'Text', text: /● trabajando/ }))?.text).toBe(' ● trabajando · pensando')
     await ui.unmount()
   }
 })
@@ -78,8 +77,105 @@ test('a narrow pane draws cards with the tokens each request cost', async ($, on
   for (const surface of ['terminal', 'desktop'] as const) {
     const ui = await $.ui.mount({ ...PANE, surface, props: { ...PANE.props, bodyColumns: 40 } })
     // Two requests of 1200 + 500 fresh in and 800 out: 5000 tokens, 60k cached.
-    expect((await ui.find({ type: 'Text', text: /tok · 2 req$/ }))?.text).toBe('sonnet-5-5 · 0s · 5.0k tok · 2 req')
+    expect((await ui.find({ type: 'Text', text: /tok · 2 req/ }))?.text).toBe('sonnet-5-5 · 5.0k tok · 2 req · 0 tools')
     expect((await ui.find({ type: 'Text', text: /caché/ }))?.text).toBe('0s · 5.0k tok (+60k caché)')
     await ui.unmount()
   }
+})
+
+// The border color of each card, in the order drawn.
+const borders = async (ui: { findAll: (q: { type: string }) => Promise<{ props: Record<string, unknown> }[]> }) =>
+  (await ui.findAll({ type: 'Box' })).filter(box => box.props.borderStyle === 'round').map(box => box.props.borderColor)
+
+test('each card is colored by its status', async ($, on) => {
+  on('command.register', () => ({ value: { command: 'subagentes' } }))
+  on('ui.open', () => ({ value: { isPlaced: true } }))
+  on('ui.status', () => ({ value: undefined }))
+  on('session.start', (_, e) => ({ cwd: e.cwd }))
+  let id = 0
+  on('agent.spawn', () => ({ model: 'claude-sonnet-5-5', agentId: `a${++id}` }))
+  on('turn.complete', () => ({ text: '' }))
+
+  await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
+  for (const [n, description] of [[1, 'Bien'], [2, 'Mal'], [3, 'Sigue']] as const) {
+    await $.agent.spawn({ ...SPAWN, tool_use_id: `tu${n}`, prompt: description, description, subagentType: 'Explore' })
+  }
+  await $.turn.complete({ turnId: 't1', agentId: 'a1', reason: 'answer', answer: '', durationMs: 0, isAborted: false })
+  await $.turn.complete({ turnId: 't2', agentId: 'a2', reason: 'error', answer: '', durationMs: 0, isAborted: false })
+
+  for (const surface of ['terminal', 'desktop'] as const) {
+    const ui = await $.ui.mount({ ...PANE, surface })
+    // The running one first, then the latest to finish.
+    expect(await borders(ui)).toEqual(['suggestion', 'error', 'success'])
+    expect((await ui.find({ type: 'Text', text: /✔ listo/ }))?.text).toBe(' ✔ listo')
+    expect((await ui.find({ type: 'Text', text: /✖ falló/ }))?.text).toBe(' ✖ falló')
+    expect((await ui.find({ type: 'Text', text: /● trabajando/ }))?.text).toBe(' ● trabajando · pensando')
+    await ui.unmount()
+  }
+})
+
+test('a finished card has a full load bar', async ($, on) => {
+  on('command.register', () => ({ value: { command: 'subagentes' } }))
+  on('ui.open', () => ({ value: { isPlaced: true } }))
+  on('ui.status', () => ({ value: undefined }))
+  on('session.start', (_, e) => ({ cwd: e.cwd }))
+  on('agent.spawn', () => ({ model: 'claude-sonnet-5-5', agentId: 'a1' }))
+  on('turn.complete', () => ({ text: '' }))
+
+  await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
+  await $.agent.spawn({ ...SPAWN, prompt: 'Listo', description: 'Listo', subagentType: 'Explore' })
+  await $.turn.complete({ turnId: 't1', agentId: 'a1', reason: 'answer', answer: '', durationMs: 0, isAborted: false })
+
+  for (const surface of ['terminal', 'desktop'] as const) {
+    const ui = await $.ui.mount({ ...PANE, surface, props: { ...PANE.props, bodyColumns: 40 } })
+    // 40 columns less the border and the padding.
+    expect((await ui.find({ type: 'Text', text: /^[━░]+$/ }))?.text).toBe('━'.repeat(36))
+    await ui.unmount()
+  }
+})
+
+test('a subagent waiting on a permission turns yellow, then works again', async ($, on) => {
+  on('command.register', () => ({ value: { command: 'subagentes' } }))
+  on('ui.open', () => ({ value: { isPlaced: true } }))
+  on('ui.status', () => ({ value: undefined }))
+  on('session.start', (_, e) => ({ cwd: e.cwd }))
+  on('agent.spawn', () => ({ model: 'claude-sonnet-5-5', agentId: 'a1' }))
+  on('tool.check', () => ({ decision: 'ask' }))
+  on('tool.call', () => ({ result: {} }))
+
+  const seen: { label?: string; borders: unknown[] }[] = []
+  // Who answers the ask: while it is open, the card shows the wait.
+  on('classic.PermissionRequest', async () => {
+    for (const surface of ['terminal', 'desktop'] as const) {
+      const ui = await $.ui.mount({ ...PANE, surface })
+      seen.push({ label: (await ui.find({ type: 'Text', text: /esperando permiso/ }))?.text, borders: await borders(ui) })
+      await ui.unmount()
+    }
+    return { decision: { behavior: 'allow' } }
+  })
+
+  await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
+  await $.agent.spawn({ ...SPAWN, prompt: 'Corre ls', description: 'Correr ls', subagentType: 'Explore' })
+  await $.tool.call({ tool: 'Bash', command: 'ls', agentId: 'a1' })
+
+  expect(seen).toEqual([
+    { label: ' ⏸ esperando permiso · Bash', borders: ['warning'] },
+    { label: ' ⏸ esperando permiso · Bash', borders: ['warning'] },
+  ])
+  for (const surface of ['terminal', 'desktop'] as const) {
+    const ui = await $.ui.mount({ ...PANE, surface })
+    expect((await ui.find({ type: 'Text', text: /● trabajando/ }))?.text).toBe(' ● trabajando · Bash')
+    expect(await borders(ui)).toEqual(['suggestion'])
+    await ui.unmount()
+  }
+})
+
+test('the permission verdict goes up untouched', async ($, on) => {
+  on('session.start', (_, e) => ({ cwd: e.cwd }))
+  on('command.register', () => ({ value: { command: 'subagentes' } }))
+  on('ui.status', () => ({ value: undefined }))
+  on('tool.check', () => ({ decision: 'ask', reason: 'Bash pide permiso' }))
+
+  await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
+  expect(await $.tool.check({ tool: 'Bash', input: { command: 'ls' } })).toEqual({ decision: 'ask', reason: 'Bash pide permiso' })
 })

@@ -8,14 +8,21 @@ const TITLE = 'Sub-agentes'
 const MAX_ROWS = 30
 // The dock width asked for on open: the card layout fits in it. A width the
 // person dragged the dock to wins over it.
-const DOCK_COLUMNS = 44
-// From this many body columns the pane draws a table instead of cards.
-const TABLE_FROM = 84
+const DOCK_COLUMNS = 46
+// From this many body columns the cards go in two columns.
+const TWO_COLUMNS_FROM = 84
+// A card's height: two border rows and five lines.
+const CARD_ROWS = 7
+// The ticker's step: fine enough to animate the load bar and the spinner.
+const FRAME_MS = 250
+const SPINNER = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏']
 
 const agents = atom({ plugin: 'subagent-table', key: 'agents' } as const, [])
 const now = atom({ plugin: 'subagent-table', key: 'now' } as const, 0)
 
-const isActive = (row: AgentRow) => row.status === 'arrancando' || row.status === 'corriendo'
+// Working: the load bar slides and the spinner turns.
+const isWorking = (row: AgentRow) => row.status === 'arrancando' || row.status === 'corriendo'
+const isActive = (row: AgentRow) => isWorking(row) || row.status === 'esperando'
 
 const shortModel = (model: string) => model.replace(/^claude-/, '').replace(/-\d{8}$/, '')
 
@@ -47,17 +54,45 @@ function tokens(n: number): string {
 
 const spent = (row: AgentRow) => row.tokensIn + row.tokensOut
 
-const STATUS_COLOR: Record<AgentStatus, string | undefined> = {
-  arrancando: 'warning',
-  corriendo: 'warning',
+// Blue working, yellow waiting on a permission, green done, red failed.
+const STATUS_COLOR: Record<AgentStatus, string> = {
+  arrancando: 'suggestion',
+  corriendo: 'suggestion',
+  esperando: 'warning',
   listo: 'success',
   error: 'error',
-  cancelado: undefined,
+  cancelado: 'inactive',
   rechazado: 'error',
 }
 
-// The ticker redraws the durations once a second while some agent runs.
+const STATUS_LABEL: Record<AgentStatus, string> = {
+  arrancando: '◌ arrancando',
+  corriendo: '● trabajando',
+  esperando: '⏸ esperando permiso',
+  listo: '✔ listo',
+  error: '✖ falló',
+  cancelado: '■ cancelado',
+  rechazado: '✖ rechazado',
+}
+
+// A working agent's bar is a block a quarter wide bouncing across the track;
+// a waiting one's stands still; a finished one's is full.
+function loadBar(row: AgentRow, at: number, cells: number): string {
+  const width = Math.max(1, cells)
+  if (row.status === 'cancelado') return '░'.repeat(width)
+  if (!isActive(row)) return '━'.repeat(width)
+  const block = Math.max(1, Math.round(width / 4))
+  const span = width - block
+  const frame = Math.floor((row.status === 'esperando' ? row.startedAt : at) / FRAME_MS)
+  const step = span === 0 ? 0 : frame % (2 * span)
+  const offset = step <= span ? step : 2 * span - step
+  return '░'.repeat(offset) + '━'.repeat(block) + '░'.repeat(span - offset)
+}
+
+// The ticker redraws the bars and the durations while some agent runs.
 let ticker: Timer | undefined
+// The second the status line was last written in: it changes once a second.
+let lastSecond = 0
 
 async function patch($: EngineInterface, match: (row: AgentRow) => boolean, fn: (row: AgentRow) => AgentRow) {
   await update($, agents, list => list.map(row => (match(row) ? fn(withUsage(row)) : row)))
@@ -81,16 +116,23 @@ async function showStatus($: EngineInterface) {
     return
   }
   const at = Date.now()
-  const running = list.filter(isActive).length
+  const active = list.filter(isActive).length
+  const waiting = list.filter(row => row.status === 'esperando').length
   const time = list.reduce((sum, row) => sum + ((row.endedAt ?? at) - row.startedAt), 0)
   const total = list.reduce((sum, row) => sum + spent(row), 0)
-  $.ui.status(`Sub-agentes: ${running} corriendo · ${list.length - running} terminados · ${duration(time)} · ${tokens(total)} tok`)
+  const counts = `${active - waiting} corriendo${waiting > 0 ? ` · ${waiting} esperando` : ''} · ${list.length - active} terminados`
+  $.ui.status(`Sub-agentes: ${counts} · ${duration(time)} · ${tokens(total)} tok`)
 }
 
 async function tick($: EngineInterface) {
   const list = await read($, agents)
-  await update($, now, () => Date.now())
-  await showStatus($)
+  const at = Date.now()
+  await update($, now, () => at)
+  const second = Math.floor(at / 1000)
+  if (second !== lastSecond) {
+    lastSecond = second
+    await showStatus($)
+  }
   if (!list.some(isActive)) {
     ticker?.cancel()
     ticker = undefined
@@ -100,7 +142,7 @@ async function tick($: EngineInterface) {
 async function startTicker($: EngineInterface) {
   await update($, now, () => Date.now())
   if (ticker !== undefined) return
-  ticker = $.clock.every(1000, () => void tick($))
+  ticker = $.clock.every(FRAME_MS, () => void tick($))
 }
 
 const openPane = ($: EngineInterface) => $.ui.open({ id: PANE, title: TITLE, columns: DOCK_COLUMNS, rows: 12 })
@@ -195,13 +237,34 @@ export const register: Register = on => {
     return result
   })
 
-  on('tool.call', async ($, e, next) => {
-    if (e.agentId !== undefined) {
+  // Only watches: the verdict goes up as core and the hooks beneath gave it.
+  // An ask inside a subagent's loop stops it until someone answers.
+  on('tool.check', async ($, e, next) => {
+    const verdict = await next(e)
+    if (e.agentId !== undefined && e.tool_use_id !== undefined && verdict.decision === 'ask') {
       const id = e.agentId
-      await patch($, row => row.agentId === id, row => ({ ...row, lastTool: e.tool, toolCount: row.toolCount + 1 }))
+      try {
+        await patch($, row => row.agentId === id, row => ({ ...row, status: 'esperando', waitingTool: e.tool }))
+        await showStatus($)
+      } catch {
+        // The panel missing a wait must never cost the call its verdict.
+      }
     }
 
-    return next(e)
+    return verdict
+  })
+
+  on('tool.call', async ($, e, next) => {
+    if (e.agentId === undefined) return next(e)
+    const id = e.agentId
+    await patch($, row => row.agentId === id, row => ({ ...row, lastTool: e.tool, toolCount: row.toolCount + 1 }))
+    const result = await next(e)
+    // The ask was answered and the tool ran (or was refused): it works again.
+    // Matched inside the update, which sees the wait the check just wrote.
+    await patch($, row => row.agentId === id && row.status === 'esperando', row => ({ ...row, status: 'corriendo', waitingTool: undefined }))
+    await showStatus($)
+
+    return result
   })
 
   on('turn.complete', async ($, e, next) => {
@@ -212,7 +275,7 @@ export const register: Register = on => {
       await patch($, row => row.agentId === id, row => {
         // The turn's own sum stands in where no step reported its usage.
         const counted = row.requests === 0 && usage !== undefined ? addUsage(row, usage) : row
-        return { ...counted, status, lastTool: undefined, endedAt: Date.now() }
+        return { ...counted, status, lastTool: undefined, waitingTool: undefined, endedAt: Date.now() }
       })
       await showStatus($)
     }
@@ -225,23 +288,24 @@ export const register: Register = on => {
     const all = (await read($, agents)).map(withUsage)
     const at = (await read($, now)) || Date.now()
     const width = e.props.bodyColumns
-    const room = Math.max(1, e.props.scroll.bodyRows - 2)
+    // The header's two lines and its margin, and the "+N más" line.
+    const room = Math.max(1, e.props.scroll.bodyRows - 4)
 
-    const running = all.filter(isActive)
-    // Running ones first, then the latest to finish.
-    const list = [...running, ...all.filter(row => !isActive(row)).reverse()]
+    const waiting = all.filter(row => row.status === 'esperando')
+    const working = all.filter(isWorking)
+    const active = waiting.length + working.length
+    // Waiting ones first, then the working ones, then the latest to finish.
+    const list = [...waiting, ...working, ...all.filter(row => !isActive(row)).reverse()]
     const time = (row: AgentRow) => duration((row.endedAt ?? at) - row.startedAt)
-    const doing = (row: AgentRow) => (isActive(row) ? row.lastTool ?? 'pensando' : `${row.toolCount} tools`)
 
     const totalTime = all.reduce((sum, row) => sum + ((row.endedAt ?? at) - row.startedAt), 0)
     const totalSpent = all.reduce((sum, row) => sum + spent(row), 0)
     const totalCached = all.reduce((sum, row) => sum + row.tokensCached, 0)
 
+    const counts = `${working.length} corriendo${waiting.length > 0 ? ` · ${waiting.length} esperando` : ''} · ${all.length - active} terminados`
     const header = (
       <Box flexDirection="column" marginBottom={1}>
-        <Text dimColor wrap="truncate-end">
-          {all.length === 0 ? 'Aún no hay sub-agentes en esta sesión.' : `${running.length} corriendo · ${all.length - running.length} terminados`}
-        </Text>
+        <Text dimColor wrap="truncate-end">{all.length === 0 ? 'Aún no hay sub-agentes en esta sesión.' : counts}</Text>
         {all.length > 0 && (
           <Text wrap="truncate-end">
             <Text bold>{duration(totalTime)}</Text>
@@ -253,76 +317,61 @@ export const register: Register = on => {
       </Box>
     )
 
-    if (width < TABLE_FROM) {
-      // Cards: three lines each, so a narrow dock loses nothing to truncation.
-      const shown = list.slice(0, Math.max(1, Math.floor(room / 4)))
+    const columns = width >= TWO_COLUMNS_FROM ? 2 : 1
+    const cardWidth = columns === 2 ? Math.floor((width - 1) / 2) : width
+    // Inside the border and the padding on each side.
+    const cells = cardWidth - 4
+    const shown = list.slice(0, Math.max(1, Math.floor(room / CARD_ROWS)) * columns)
+
+    const Card = (row: AgentRow) => {
+      const isDone = !isActive(row)
+      const color = STATUS_COLOR[row.status]
+      const doing = isDone ? row.description : `${row.lastTool ?? 'pensando'} · ${row.description}`
+      const detail =
+        row.status === 'esperando' ? ` · ${row.waitingTool ?? ''}` : row.status === 'corriendo' ? ` · ${row.lastTool ?? 'pensando'}` : ''
       return (
-        <Box flexDirection="column">
-          {header}
-          {shown.map(row => {
-            const isDone = !isActive(row)
-            return (
-              <Box key={`${row.toolUseId}-${row.startedAt}`} flexDirection="column" marginBottom={1}>
-                <Box flexDirection="row">
-                  <Box flexGrow={1} flexShrink={1}>
-                    <Text bold dimColor={isDone} wrap="truncate-end">{shortType(row.type)}</Text>
-                  </Box>
-                  <Box flexShrink={0} marginLeft={1}>
-                    <Text color={STATUS_COLOR[row.status]}>{row.status}</Text>
-                  </Box>
-                </Box>
-                <Text dimColor={isDone} wrap="truncate-end">
-                  {`${row.model} · ${time(row)} · ${tokens(spent(row))} tok · ${row.requests} req`}
-                </Text>
-                <Text dimColor wrap="truncate-end">{`${doing(row)} · ${row.description}`}</Text>
-              </Box>
-            )
-          })}
-          {list.length > shown.length && <Text dimColor>{`+${list.length - shown.length} más`}</Text>}
+        <Box
+          key={`${row.toolUseId}-${row.startedAt}`}
+          flexDirection="column"
+          borderStyle="round"
+          borderColor={color}
+          paddingX={1}
+          width={cardWidth}
+          flexShrink={0}
+        >
+          <Box flexDirection="row">
+            <Box flexGrow={1} flexShrink={1}>
+              <Text bold dimColor={isDone} wrap="truncate-end">{shortType(row.type)}</Text>
+            </Box>
+            <Box flexShrink={0} marginLeft={1}>
+              <Text dimColor={isDone}>
+                {isWorking(row) ? `${SPINNER[Math.floor(at / FRAME_MS) % SPINNER.length]} ${time(row)}` : time(row)}
+              </Text>
+            </Box>
+          </Box>
+          <Text dimColor={isDone} wrap="truncate-end">
+            {`${row.model} · ${tokens(spent(row))} tok · ${row.requests} req · ${row.toolCount} tools`}
+          </Text>
+          <Text dimColor wrap="truncate-end">{doing}</Text>
+          <Text color={color} wrap="truncate-end">{loadBar(row, at, cells)}</Text>
+          <Box backgroundColor={color}>
+            <Text color="inverseText" bold wrap="truncate-end">{` ${STATUS_LABEL[row.status]}${detail}`}</Text>
+          </Box>
         </Box>
       )
     }
 
-    const Row = (
-      cells: { type: string; model: string; status: string; time: string; spent: string; cached: string; doing: string; task: string },
-      color?: string,
-      isBold?: boolean,
-      isDim?: boolean,
-    ) => (
-      <Box flexDirection="row" gap={1}>
-        <Box flexGrow={1} flexShrink={1} minWidth={12}><Text bold={isBold} dimColor={isDim} wrap="truncate-end">{cells.type}</Text></Box>
-        <Box width={11} flexShrink={0}><Text bold={isBold} dimColor={isDim} wrap="truncate-end">{cells.model}</Text></Box>
-        <Box width={10} flexShrink={0}><Text bold={isBold} color={color} wrap="truncate-end">{cells.status}</Text></Box>
-        <Box width={7} flexShrink={0}><Text bold={isBold} dimColor={isDim} wrap="truncate-end">{cells.time}</Text></Box>
-        <Box width={7} flexShrink={0}><Text bold={isBold} dimColor={isDim} wrap="truncate-end">{cells.spent}</Text></Box>
-        <Box width={7} flexShrink={0}><Text bold={isBold} dimColor wrap="truncate-end">{cells.cached}</Text></Box>
-        <Box width={12} flexShrink={0}><Text bold={isBold} dimColor={isDim} wrap="truncate-end">{cells.doing}</Text></Box>
-        <Box flexGrow={2} flexShrink={1}><Text bold={isBold} dimColor={isDim} wrap="truncate-end">{cells.task}</Text></Box>
-      </Box>
-    )
-
     return (
       <Box flexDirection="column">
         {header}
-        {all.length > 0 &&
-          Row({ type: 'Agente', model: 'Modelo', status: 'Estado', time: 'Tiempo', spent: 'Tokens', cached: 'Caché', doing: 'Haciendo', task: 'Tarea' }, undefined, true)}
-        {list.slice(0, room - 1).map(row =>
-          Row(
-            {
-              type: shortType(row.type),
-              model: row.model,
-              status: row.status,
-              time: time(row),
-              spent: tokens(spent(row)),
-              cached: tokens(row.tokensCached),
-              doing: doing(row),
-              task: row.description,
-            },
-            STATUS_COLOR[row.status],
-            false,
-            !isActive(row),
-          ),
+        {columns === 2 ? (
+          <Box flexDirection="row" flexWrap="wrap" columnGap={1}>
+            {shown.map(Card)}
+          </Box>
+        ) : (
+          shown.map(Card)
         )}
+        {list.length > shown.length && <Text dimColor>{`+${list.length - shown.length} más`}</Text>}
       </Box>
     )
   })

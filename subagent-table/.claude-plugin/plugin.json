@@ -1,6 +1,6 @@
 {
   "name": "subagent-table",
-  "version": "0.2.0",
-  "description": "Panel de los sub-agentes de la sesión: tipo, modelo, estado, tiempo, tokens y caché, con resumen en la línea de estado",
+  "version": "0.3.0",
+  "description": "Panel de los sub-agentes de la sesión en tarjetas con barra de carga y estado por color (azul trabajando, amarillo esperando permiso, verde listo, rojo falló), con resumen en la línea de estado",
   "types": "./types/index.d.ts"
 }
