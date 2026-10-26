@@ -261,13 +261,14 @@ export const register: Register = on => {
     if (e.agentId === undefined) return next(e)
     const id = e.agentId
     await patch($, row => row.agentId === id, row => ({ ...row, lastTool: e.tool, toolCount: row.toolCount + 1 }))
-    const result = await next(e)
-    // The ask was answered and the tool ran (or was refused): it works again.
-    // Matched inside the update, which sees the wait the check just wrote.
-    await patch($, row => row.agentId === id && row.status === 'esperando', row => ({ ...row, status: 'corriendo', waitingTool: undefined }))
-    await showStatus($)
-
-    return result
+    try {
+      return await next(e)
+    } finally {
+      // The ask was answered and the tool ran, was refused or threw: it works again.
+      // Matched inside the update, which sees the wait the check just wrote.
+      await patch($, row => row.agentId === id && row.status === 'esperando', row => ({ ...row, status: 'corriendo', waitingTool: undefined }))
+      await showStatus($)
+    }
   })
 
   on('turn.complete', async ($, e, next) => {
