@@ -85,10 +85,6 @@ const PHASE_COLOR: Record<Phase, string | undefined> = {
 
 const REVIEW_PHASES: readonly Phase[] = ['revisando', 'revision enviada', 'aplicando revision']
 
-// The texts `entregar` is sending right now. Its $.session.send is judged as a
-// SendMessage call, and auto mode's classifier gives no verdict on a send the
-// model did not write itself; the tool.check hook allows exactly these texts.
-const outgoing = new Set<string>()
 const SPINNER = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏']
 
 const INSTRUCTIONS: Record<Role, string> = {
@@ -329,8 +325,7 @@ export const register: Register = on => {
     if (partner === undefined) return { deny: `No hay sesión que ${partnerOf(mine)}. Pídele a la persona que abra otra y corra /relevo ${cmdOf(partnerOf(mine))}.` }
 
     const text = `[relevo] ${kind} de la sesión que ${mine}\n\n${summary}\n\n(Responde con la herramienta ${TOOL}.)`
-    outgoing.add(text)
-    const sent = await $.session.send({ to: { sessionId: partner.sessionId }, text }).finally(() => outgoing.delete(text))
+    const sent = await $.session.send({ to: { sessionId: partner.sessionId }, text })
     if (!sent.isDelivered) {
       return { deny: `No se entregó: ${sent.reason}. No reintentes igual: avísale a la persona (puede que la otra sesión esté cerrada).` }
     }
@@ -343,14 +338,6 @@ export const register: Register = on => {
     const after = kind === 'aprobado' ? 'Cuéntale a la persona el resultado.' : 'Termina tu turno; la respuesta llega sola.'
     return { result: `Entregado a la sesión que ${partnerOf(mine)}. ${after}` }
   }).catch(() => ({ deny: 'relevo falló al entregar; reintenta o avísale a la persona.' }))
-
-  // Allow only the send entregar is making now; any other SendMessage keeps its normal verdict.
-  on('tool.check', { tool: 'SendMessage' }, async ($, e, next) => {
-    const input = e.input as { message?: unknown; text?: unknown }
-    const message = typeof input?.message === 'string' ? input.message : input?.text
-    if (typeof message === 'string' && outgoing.has(message)) return { decision: 'allow' as const }
-    return next(e)
-  })
 
   on('session.receive', async ($, e, next) => {
     const found = /\[relevo\] (\w+) de la sesión que (planifica|construye)\n\n([\s\S]*?)\n\n\(Responde/.exec(e.text)

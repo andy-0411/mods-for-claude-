@@ -18,7 +18,7 @@ type Sent = { to: unknown; text: string }
 
 // Nothing sits beneath the plugin: these hooks stand for the engine, the store
 // a map in memory as the JSON file stands between two sessions.
-function stubEngine(on: any, sent: Sent[] = [], send?: (e: Sent) => unknown) {
+function stubEngine(on: any, sent: Sent[] = []) {
   const store = new Map<string, unknown>()
   on('store.get', (_: unknown, e: { key: string }) => ({ value: store.get(e.key) }))
   on('store.set', (_: unknown, e: { key: string; value: unknown }) => {
@@ -37,7 +37,7 @@ function stubEngine(on: any, sent: Sent[] = [], send?: (e: Sent) => unknown) {
   on('session.cwd', () => ({ value: '/repo' }))
   on('session.send', (_: unknown, e: Sent) => {
     sent.push({ to: e.to, text: e.text })
-    return send?.(e) ?? { isDelivered: true }
+    return { isDelivered: true }
   })
   on('session.receive', (_: unknown, e: { text: string }) => ({ text: e.text }))
   on('turn.start', (_: unknown, e: { turnId: string }) => ({ turnId: e.turnId }))
@@ -168,27 +168,4 @@ test('the pane shows both sessions and spins for the busy one', async ($, on) =>
   expect(await ui.find({ type: 'Text', text: /plan creado/ })).toBeDefined()
   expect((await ui.find({ type: 'Text', text: /construyendo plan/ }))?.text).toMatch(BRAILLE)
   await ui.unmount()
-})
-
-test('auto mode lets entregar send, and only its own message', async ($, on) => {
-  const verdicts: string[] = []
-  // As the engine judges a plugin's send: the SendMessage check, which under
-  // auto mode the classifier would leave without a verdict.
-  const store = stubEngine(on, [], async e => {
-    const { decision } = await $.tool.check({ tool: 'SendMessage', input: { to: e.to, message: e.text } })
-    verdicts.push(decision)
-    return decision === 'allow' ? { isDelivered: true } : { isDelivered: false, reason: 'auto mode gave no verdict' }
-  })
-  on('tool.check', () => ({ decision: 'deny', reason: 'auto mode gave no verdict' }))
-
-  await $.session.start({ cwd: '/repo', surface: 'terminal', isInteractive: true })
-  await relevo($, 'plan')
-  store.set('sesion:construye', { sessionId: 'sesion-b', cwd: '/repo', at: 0 })
-
-  const ok = await $.tool.call({ tool: 'mcp__relevo__entregar', tipo: 'plan', resumen: 'Paso 1' })
-  expect(ok.deny).toBeUndefined()
-  expect(verdicts).toEqual(['allow'])
-
-  const other = await $.tool.check({ tool: 'SendMessage', input: { to: 'x', message: 'otra cosa' } })
-  expect(other.decision).toBe('deny')
 })
