@@ -189,3 +189,49 @@ test('the pane shows both sessions and spins for the busy one', async ($, on) =>
   expect((await ui.find({ type: 'Text', text: /construyendo plan/ }))?.text).toMatch(BRAILLE)
   await ui.unmount()
 })
+
+test('the transcript shows one line per handoff, and everything when expanded', async ($, on) => {
+  mock.clock(on, { now: Date.now() })
+  stubEngine(on)
+  // The engine's own drawing of a row the plugin passes on: its text, or the call's input.
+  on('ui.render', ($: any, e: any) => {
+    const { Text } = $.ui.resolve(e)
+    return <Text>{e.props.text ?? JSON.stringify(e.props.input)}</Text>
+  })
+  await $.session.start({ cwd: '/repo', surface: 'terminal', isInteractive: true })
+  await relevo($, 'build')
+
+  const letter = '[relevo] plan de la sesión que planifica\n\nPaso 1 largo\n\n(Responde con la herramienta mcp__relevo__entregar.)'
+  const message = (isExpanded: boolean) => ({
+    plugin: 'relevo',
+    surface: 'terminal',
+    component: 'UserMessage',
+    props: { text: letter, origin: { kind: 'plugin', name: 'relevo' }, isExpanded },
+  })
+  const short = await $.ui.mount(message(false) as any)
+  expect(await short.find({ type: 'Text', text: /📥 plan recibido de la sesión que planifica/ })).toBeDefined()
+  expect(await short.find({ type: 'Text', text: /Paso 1 largo/ })).toBeUndefined()
+  await short.unmount()
+  const full = await $.ui.mount(message(true) as any)
+  expect(await full.find({ type: 'Text', text: /Paso 1 largo/ })).toBeDefined()
+  await full.unmount()
+
+  const call = await $.ui.mount({
+    plugin: 'relevo',
+    surface: 'terminal',
+    component: 'ToolUse',
+    requestId: 't1',
+    props: {
+      tool_use_id: 't1',
+      tool: 'mcp__relevo__entregar',
+      input: { tipo: 'entrega', resumen: 'Cambié 4 archivos y corrí los tests' },
+      isRunning: false,
+      isErrored: false,
+      isInterrupted: false,
+      isExpanded: false,
+    },
+  } as any)
+  expect(await call.find({ type: 'Text', text: /entregado a la sesión que planifica/ })).toBeDefined()
+  expect(await call.find({ type: 'Text', text: /Cambié 4 archivos/ })).toBeUndefined()
+  await call.unmount()
+})

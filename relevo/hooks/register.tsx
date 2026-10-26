@@ -389,6 +389,36 @@ export const register: Register = on => {
     return next(e)
   }).catch(($, e, next) => next(e))
 
+  // The transcript shows one line per handoff; the model still reads it whole, and ctrl+o shows all.
+  on('ui.render', { component: 'UserMessage' }, async ($, e, next) => {
+    const { origin, text, isExpanded } = e.props
+    const found = /\[relevo\] (\w+) de la sesión que (planifica|construye)/.exec(text)
+    if (isExpanded || origin.kind !== 'plugin' || origin.name !== 'relevo' || found === null) return next(e)
+    return next({ ...e, props: { ...e.props, text: `📥 ${found[1]} recibido de la sesión que ${found[2]}` } })
+  }).catch(($, e, next) => next(e))
+
+  on('ui.render', { component: 'ToolUse' }, async ($, e, next) => {
+    const { tool, input, isExpanded, isErrored, isRunning } = e.props
+    if (tool !== TOOL || isExpanded || isErrored) return next(e)
+    const { Text } = $.ui.resolve(e)
+    const kind = (input as { tipo?: string } | undefined)?.tipo ?? 'entrega'
+    const mine = await read($, role)
+    const to = mine === null ? 'la otra sesión' : `la sesión que ${partnerOf(mine)}`
+    return (
+      <Text>
+        <Text bold color={KIND_COLOR[kind as HandoffKind]}>📤 {kind}</Text>
+        <Text dimColor> {isRunning ? 'entregando…' : `entregado a ${to}`}</Text>
+      </Text>
+    )
+  }).catch(($, e, next) => next(e))
+
+  on('ui.render', { component: 'ToolResult' }, async ($, e, next) => {
+    const { tool, isExpanded, isErrored } = e.props
+    if (tool !== TOOL || isExpanded || isErrored) return next(e)
+    const { Text } = $.ui.resolve(e)
+    return <Text dimColor>  ⎿ en el buzón</Text>
+  }).catch(($, e, next) => next(e))
+
   on('ui.render', { component: 'Pane', requestId: PANE }, async ($, e) => {
     const { Box, Text } = $.ui.resolve(e)
     const mine = await read($, role)
