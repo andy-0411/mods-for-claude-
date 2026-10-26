@@ -1,7 +1,7 @@
 import { atom, read, update } from 'claude-code'
 import type { EngineInterface, Register } from 'claude-code'
 
-import type { Handoff, HandoffKind, Role, Seat } from '../types'
+import type { Handoff, HandoffKind, Phase, Role, Seat } from '../types'
 
 const PANE = 'relevo'
 const TITLE = 'Relevo'
@@ -9,14 +9,30 @@ const TOOL = 'mcp__relevo__entregar'
 const PLAN_FILE = '.relevo/plan.md'
 const MAX_ROUNDS = 3
 const MAX_LOG = 50
+const POLL_MS = 1000
+const FRAME_MS = 120
 
 const role = atom({ plugin: 'relevo', key: 'role' } as const, null)
 const log = atom({ plugin: 'relevo', key: 'log' } as const, [])
 const rounds = atom({ plugin: 'relevo', key: 'rounds' } as const, 0)
+// The seats as last read from the shared store: this session's and its partner's.
+const self = atom({ plugin: 'relevo', key: 'self' } as const, null)
+const peer = atom({ plugin: 'relevo', key: 'peer' } as const, null)
+const frame = atom({ plugin: 'relevo', key: 'frame' } as const, 0)
 
 const ROLES: readonly Role[] = ['planifica', 'construye']
 const partnerOf = (mine: Role): Role => (mine === 'planifica' ? 'construye' : 'planifica')
 const seatKey = (of: Role) => `sesion:${of}`
+const cmdOf = (of: Role) => (of === 'planifica' ? 'plan' : 'build')
+const LABEL: Record<Role, string> = { planifica: 'Planifica', construye: 'Construye' }
+
+// What `/relevo <arg>` means; the Spanish words keep working.
+const ALIASES: Record<string, string> = {
+  plan: 'planifica', planifica: 'planifica',
+  build: 'construye', construye: 'construye',
+  status: 'estado', estado: 'estado', '': 'estado',
+  exit: 'salir', leave: 'salir', salir: 'salir',
+}
 
 const KINDS: Record<Role, readonly HandoffKind[]> = {
   planifica: ['plan', 'revision', 'respuesta', 'aprobado'],
@@ -31,6 +47,49 @@ const KIND_COLOR: Record<HandoffKind, string | undefined> = {
   respuesta: undefined,
   aprobado: 'success',
 }
+
+const FIRST_PHASE: Record<Role, Phase> = { planifica: 'listo', construye: 'esperando plan' }
+
+// The phase a session moves to when it sends a handoff, and when it receives one.
+const SENT_PHASE: Record<HandoffKind, Phase> = {
+  plan: 'plan creado',
+  revision: 'revision enviada',
+  respuesta: 'respuesta enviada',
+  aprobado: 'aprobado',
+  entrega: 'entregado',
+  pregunta: 'pregunta enviada',
+}
+const RECEIVED_PHASE: Record<HandoffKind, Phase> = {
+  entrega: 'revisando',
+  pregunta: 'revisando',
+  plan: 'construyendo plan',
+  revision: 'aplicando revision',
+  respuesta: 'construyendo plan',
+  aprobado: 'aprobado',
+}
+
+const PHASE_COLOR: Record<Phase, string | undefined> = {
+  listo: undefined,
+  'esperando plan': undefined,
+  planificando: 'suggestion',
+  'construyendo plan': 'suggestion',
+  'aplicando revision': 'suggestion',
+  revisando: 'suggestion',
+  'plan creado': 'warning',
+  entregado: 'warning',
+  'revision enviada': 'warning',
+  'respuesta enviada': 'warning',
+  'pregunta enviada': 'warning',
+  aprobado: 'success',
+}
+
+const REVIEW_PHASES: readonly Phase[] = ['revisando', 'revision enviada', 'aplicando revision']
+
+// The texts `entregar` is sending right now. Its $.session.send is judged as a
+// SendMessage call, and auto mode's classifier gives no verdict on a send the
+// model did not write itself; the tool.check hook allows exactly these texts.
+const outgoing = new Set<string>()
+const SPINNER = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏']
 
 const INSTRUCTIONS: Record<Role, string> = {
   planifica: [
@@ -56,6 +115,44 @@ async function seatOf($: EngineInterface, of: Role): Promise<Seat | undefined> {
   return typeof seat === 'object' && seat !== null && 'sessionId' in seat ? (seat as Seat) : undefined
 }
 
+const phaseOf = (of: Role, seat: Seat) => seat.phase ?? FIRST_PHASE[of]
+
+// Merges a patch into this session's own seat, if the seat is still this session's.
+async function mark($: EngineInterface, patch: Partial<Seat> | ((seat: Seat, of: Role) => Partial<Seat>)) {
+  const mine = await read($, role)
+  if (mine === null) return
+  const seat = await seatOf($, mine)
+  if (seat === undefined || seat.sessionId !== (await $.session.id())) return
+  const changes = typeof patch === 'function' ? patch(seat, mine) : patch
+  const next: Seat = { ...seat, ...changes }
+  if (changes.phase !== undefined && changes.phase !== seat.phase) next.phaseAt = Date.now()
+  await $.store.set(seatKey(mine), next)
+  await refreshSelf($, next)
+}
+
+// Write the atoms only when the value changed, so a quiet poll redraws nothing.
+const same = (a: Seat | null, b: Seat | null) => JSON.stringify(a) === JSON.stringify(b)
+
+async function refreshSelf($: EngineInterface, value: Seat | null) {
+  if (!same(await read($, self), value)) await update($, self, () => value)
+}
+
+async function refreshPeer($: EngineInterface, value: Seat | null) {
+  if (!same(await read($, peer), value)) await update($, peer, () => value)
+}
+
+async function poll($: EngineInterface) {
+  const mine = await read($, role)
+  if (mine === null) {
+    await refreshSelf($, null)
+    await refreshPeer($, null)
+    return
+  }
+  const own = await seatOf($, mine)
+  await refreshSelf($, own !== undefined && own.sessionId === (await $.session.id()) ? own : null)
+  await refreshPeer($, (await seatOf($, partnerOf(mine))) ?? null)
+}
+
 async function record($: EngineInterface, entry: Handoff) {
   await update($, log, list => [...list, entry].slice(-MAX_LOG))
 }
@@ -66,6 +163,8 @@ async function leave($: EngineInterface) {
   const seat = await seatOf($, mine)
   if (seat?.sessionId === (await $.session.id())) await $.store.delete(seatKey(mine))
   await update($, role, () => null)
+  await refreshSelf($, null)
+  await refreshPeer($, null)
 }
 
 function clock(at: number): string {
@@ -73,17 +172,36 @@ function clock(at: number): string {
   return `${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`
 }
 
+function ago(at: number): string {
+  const minutes = Math.floor((Date.now() - at) / 60_000)
+  if (minutes < 1) return 'ahora'
+  if (minutes < 60) return `hace ${minutes}m`
+  return `hace ${Math.floor(minutes / 60)}h`
+}
+
 async function status($: EngineInterface): Promise<string> {
   const mine = await read($, role)
-  if (mine === null) return 'Esta sesión no tiene rol. Usa /relevo planifica o /relevo construye.'
-  const partner = await seatOf($, partnerOf(mine))
+  if (mine === null) return 'Esta sesión no tiene rol. Usa /relevo plan o /relevo build.'
+  const id = await $.session.id()
   const cwd = await $.session.cwd()
-  const lines = [`Esta sesión ${mine}.`]
+  const lines: string[] = []
+  let partner: Seat | undefined
+  for (const of of ROLES) {
+    const seat = await seatOf($, of)
+    const isMine = of === mine && seat?.sessionId === id
+    if (of !== mine) partner = seat
+    if (seat === undefined) {
+      lines.push(`${LABEL[of]}: sin conectar`)
+      continue
+    }
+    const busy = seat.busy === true ? ' ⠿ trabajando' : ''
+    const since = isMine ? '' : ` · desde ${clock(seat.at)}`
+    lines.push(`${LABEL[of]}${isMine ? ' (esta sesión)' : ''}: ${phaseOf(of, seat)}${busy} · ${ago(seat.phaseAt ?? seat.at)}${since}`)
+  }
   if (partner === undefined) {
-    lines.push(`Falta la otra sesión: abre otra terminal en ${cwd} y corre /relevo ${partnerOf(mine)}.`)
-  } else {
-    lines.push(`Pareja: la sesión que ${partnerOf(mine)} (desde ${clock(partner.at)}).`)
-    if (partner.cwd !== cwd) lines.push(`Ojo: la otra sesión corre en ${partner.cwd}, no en ${cwd}; el plan y el código no se van a ver.`)
+    lines.push(`Falta la otra sesión: abre otra terminal en ${cwd} y corre /relevo ${cmdOf(partnerOf(mine))}.`)
+  } else if (partner.cwd !== cwd) {
+    lines.push(`Ojo: la otra sesión corre en ${partner.cwd}, no en ${cwd}; el plan y el código no se van a ver.`)
   }
   return lines.join('\n')
 }
@@ -92,7 +210,7 @@ export const register: Register = on => {
   on('session.start', async ($, e, next) => {
     await $.command.register({
       name: 'relevo',
-      description: 'Pareja de sesiones: /relevo planifica | construye | estado | salir',
+      description: 'Pareja de sesiones: /relevo plan | build | status | exit',
     })
     await $.tool.register({
       name: 'entregar',
@@ -109,6 +227,17 @@ export const register: Register = on => {
       },
       isDeferred: false,
     })
+
+    // The store has no change event: poll it for the partner's seat, and spin
+    // the frame only while one of the two sessions has a turn running.
+    $.clock.every(POLL_MS, () => void poll($).catch(() => undefined))
+    $.clock.every(FRAME_MS, () =>
+      void (async () => {
+        const [own, other] = [await read($, self), await read($, peer)]
+        if (own?.busy === true || other?.busy === true) await update($, frame, n => (n + 1) % SPINNER.length)
+      })().catch(() => undefined),
+    )
+
     if ((await read($, role)) !== null) void $.ui.open({ id: PANE, title: TITLE })
 
     return next(e)
@@ -119,8 +248,24 @@ export const register: Register = on => {
     return next(e)
   })
 
+  on('turn.start', async ($, e, next) => {
+    if (e.agentId === undefined) {
+      await mark($, (seat, of) => ({
+        busy: true,
+        ...(of === 'planifica' && phaseOf(of, seat) === 'listo' ? { phase: 'planificando' as const } : {}),
+      })).catch(() => undefined)
+    }
+    return next(e)
+  })
+
+  on('turn.complete', async ($, e, next) => {
+    if (e.agentId === undefined) await mark($, { busy: false }).catch(() => undefined)
+    return next(e)
+  })
+
   on('command.run', { command: 'relevo' }, async ($, e) => {
-    const arg = e.args.trim().toLowerCase()
+    const typed = e.args.trim().toLowerCase()
+    const arg = ALIASES[typed]
 
     if (arg === 'salir') {
       await leave($)
@@ -131,20 +276,30 @@ export const register: Register = on => {
       const mine = arg as Role
       const before = await read($, role)
       if (before !== null && before !== mine) await leave($)
-      await $.store.set(seatKey(mine), { sessionId: await $.session.id(), cwd: await $.session.cwd(), at: Date.now() })
+      const now = Date.now()
+      const seat: Seat = {
+        sessionId: await $.session.id(),
+        cwd: await $.session.cwd(),
+        at: now,
+        phase: FIRST_PHASE[mine],
+        phaseAt: now,
+        busy: false,
+      }
+      await $.store.set(seatKey(mine), seat)
       await update($, role, () => mine)
       await update($, rounds, () => 0)
+      await poll($)
       await $.ui.open({ id: PANE, title: TITLE })
       const tip = mine === 'planifica' ? 'Sugerido: Opus 5.5 (/model opus).' : 'Sugerido: Sonnet 5.5 (/model sonnet).'
       return { text: `${await status($)}\n${tip}` }
     }
 
-    if (arg === '' || arg === 'estado') {
+    if (arg === 'estado') {
       await $.ui.open({ id: PANE, title: TITLE })
       return { text: await status($) }
     }
 
-    return { text: `No conozco «${arg}». Usa /relevo planifica | construye | estado | salir.` }
+    return { text: `No conozco «${typed}». Usa /relevo plan | build | status | exit.` }
   })
 
   on('prompt.compose', async ($, e, next) => {
@@ -158,7 +313,7 @@ export const register: Register = on => {
   on('tool.call', { tool: TOOL }, async ($, e) => {
     const input = e as unknown as { tipo?: string; resumen?: string }
     const mine = await read($, role)
-    if (mine === null) return { deny: 'Esta sesión no está en una pareja de relevo. La persona debe correr /relevo planifica o /relevo construye.' }
+    if (mine === null) return { deny: 'Esta sesión no está en una pareja de relevo. La persona debe correr /relevo plan o /relevo build.' }
 
     const kind = input.tipo as HandoffKind
     if (!KINDS[mine].includes(kind)) return { deny: `La sesión que ${mine} solo entrega: ${KINDS[mine].join(', ')}.` }
@@ -171,30 +326,47 @@ export const register: Register = on => {
     }
 
     const partner = await seatOf($, partnerOf(mine))
-    if (partner === undefined) return { deny: `No hay sesión que ${partnerOf(mine)}. Pídele a la persona que abra otra y corra /relevo ${partnerOf(mine)}.` }
+    if (partner === undefined) return { deny: `No hay sesión que ${partnerOf(mine)}. Pídele a la persona que abra otra y corra /relevo ${cmdOf(partnerOf(mine))}.` }
 
     const text = `[relevo] ${kind} de la sesión que ${mine}\n\n${summary}\n\n(Responde con la herramienta ${TOOL}.)`
-    const sent = await $.session.send({ to: { sessionId: partner.sessionId }, text })
-    if (!sent.isDelivered) return { deny: `No se entregó: ${sent.reason}. Puede que la otra sesión esté cerrada.` }
+    outgoing.add(text)
+    const sent = await $.session.send({ to: { sessionId: partner.sessionId }, text }).finally(() => outgoing.delete(text))
+    if (!sent.isDelivered) {
+      return { deny: `No se entregó: ${sent.reason}. No reintentes igual: avísale a la persona (puede que la otra sesión esté cerrada).` }
+    }
 
     if (kind === 'revision') await update($, rounds, n => n + 1)
     if (kind === 'plan' || kind === 'aprobado') await update($, rounds, () => 0)
     await record($, { at: Date.now(), kind, from: mine, direction: 'sale', summary })
+    await mark($, { phase: SENT_PHASE[kind] }).catch(() => undefined)
 
     const after = kind === 'aprobado' ? 'Cuéntale a la persona el resultado.' : 'Termina tu turno; la respuesta llega sola.'
-    return { result: { content: [{ type: 'text', text: `Entregado a la sesión que ${partnerOf(mine)}. ${after}` }], isError: false } }
+    return { result: `Entregado a la sesión que ${partnerOf(mine)}. ${after}` }
   }).catch(() => ({ deny: 'relevo falló al entregar; reintenta o avísale a la persona.' }))
+
+  // Allow only the send entregar is making now; any other SendMessage keeps its normal verdict.
+  on('tool.check', { tool: 'SendMessage' }, async ($, e, next) => {
+    const input = e.input as { message?: unknown; text?: unknown }
+    const message = typeof input?.message === 'string' ? input.message : input?.text
+    if (typeof message === 'string' && outgoing.has(message)) return { decision: 'allow' as const }
+    return next(e)
+  })
 
   on('session.receive', async ($, e, next) => {
     const found = /\[relevo\] (\w+) de la sesión que (planifica|construye)\n\n([\s\S]*?)\n\n\(Responde/.exec(e.text)
     if ((e.origin.kind === 'peer' || e.origin.kind === 'peer-send-message') && found !== null && e.agentId === undefined) {
+      const kind = found[1] as HandoffKind
       await record($, {
         at: Date.now(),
-        kind: found[1] as HandoffKind,
+        kind,
         from: found[2] as Role,
         direction: 'entra',
         summary: found[3] ?? '',
       })
+      // The builder counts the rounds it receives, as the planner counts those it sends.
+      if (kind === 'revision') await update($, rounds, n => n + 1)
+      if (kind === 'plan' || kind === 'aprobado') await update($, rounds, () => 0)
+      if (kind in RECEIVED_PHASE) await mark($, { phase: RECEIVED_PHASE[kind] })
     }
 
     return next(e)
@@ -205,33 +377,75 @@ export const register: Register = on => {
     const mine = await read($, role)
     const list = await read($, log)
     const done = await read($, rounds)
-    const room = Math.max(1, Math.floor(((e.viewport?.rows ?? 24) - 4) / 2))
+    const own = await read($, self)
+    const other = await read($, peer)
+    const tick = await read($, frame)
 
     if (mine === null) {
-      return <Text dimColor>Sin rol. Corre /relevo planifica o /relevo construye.</Text>
+      return <Text dimColor>Sin rol. Corre /relevo plan o /relevo build.</Text>
     }
 
-    const partner = await seatOf($, partnerOf(mine))
+    const seats: Record<Role, Seat | null> = mine === 'planifica'
+      ? { planifica: own, construye: other }
+      : { planifica: other, construye: own }
+
+    const card = (of: Role) => {
+      const seat = seats[of]
+      const isMine = of === mine
+      const head = (
+        <Text>
+          <Text bold>{isMine ? '◆' : '◇'} {LABEL[of]}</Text>
+          {isMine && <Text dimColor> · esta sesión</Text>}
+        </Text>
+      )
+      if (seat === null) {
+        return (
+          <Box flexDirection="column" borderStyle="round" borderDimColor paddingX={1}>
+            {head}
+            <Text dimColor>sin conectar — /relevo {cmdOf(of)}</Text>
+          </Box>
+        )
+      }
+      const phase = phaseOf(of, seat)
+      const color = PHASE_COLOR[phase]
+      const glyph = seat.busy === true
+        ? SPINNER[tick % SPINNER.length]
+        : phase === 'aprobado' ? '✓' : color === undefined ? '◌' : '●'
+      return (
+        <Box flexDirection="column" borderStyle="round" borderColor={color} borderDimColor={color === undefined} paddingX={1}>
+          {head}
+          <Box justifyContent="space-between">
+            <Text color={color} dimColor={color === undefined}>{glyph} {phase}</Text>
+            <Text dimColor>{ago(seat.phaseAt ?? seat.at)}</Text>
+          </Box>
+        </Box>
+      )
+    }
+
+    const phases = [own, other].flatMap(seat => (seat?.phase === undefined ? [] : [seat.phase]))
+    const showRounds = done > 0 || phases.some(phase => REVIEW_PHASES.includes(phase))
+    const rows = e.props.scroll?.bodyRows ?? e.viewport?.rows ?? 24
+    const room = Math.max(1, rows - (8 + (showRounds ? 1 : 0) + 3))
 
     return (
       <Box flexDirection="column">
-        <Text>
-          <Text bold>{mine === 'planifica' ? 'Planifica' : 'Construye'}</Text>
-          <Text dimColor>
-            {' · '}
-            {partner === undefined ? `falta la sesión que ${partnerOf(mine)}` : `pareja conectada`}
-            {mine === 'planifica' ? ` · revisiones ${done}/${MAX_ROUNDS}` : ''}
+        {card('planifica')}
+        {card('construye')}
+        {showRounds && (
+          <Text>
+            <Text dimColor>  revisiones </Text>
+            <Text color="warning">{'●'.repeat(Math.min(done, MAX_ROUNDS))}</Text>
+            <Text dimColor>{'○'.repeat(Math.max(0, MAX_ROUNDS - done))}  {done}/{MAX_ROUNDS}</Text>
           </Text>
-        </Text>
-        {list.length === 0 && <Text dimColor>Aún no hay entregas.</Text>}
+        )}
+        <Text> </Text>
+        {list.length === 0 && <Text dimColor>  Aún no hay entregas.</Text>}
         {list.slice(-room).map(entry => (
-          <Box flexDirection="column">
-            <Text>
-              <Text dimColor>{clock(entry.at)} {entry.direction === 'sale' ? '→' : '←'} </Text>
-              <Text bold color={KIND_COLOR[entry.kind]}>{entry.kind}</Text>
-            </Text>
-            <Text dimColor wrap="truncate-end">  {entry.summary.split('\n')[0]}</Text>
-          </Box>
+          <Text wrap="truncate-end">
+            <Text dimColor>  {clock(entry.at)} {entry.direction === 'sale' ? '↗' : '↙'} </Text>
+            <Text bold color={KIND_COLOR[entry.kind]}>{entry.kind.padEnd(9)}</Text>
+            <Text dimColor> {entry.summary.split('\n')[0]}</Text>
+          </Text>
         ))}
       </Box>
     )
