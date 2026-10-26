@@ -1,13 +1,17 @@
-export type AgentStatus = 'arrancando' | 'corriendo' | 'listo' | 'error' | 'cancelado' | 'rechazado'
+export type AgentStatus = 'arrancando' | 'corriendo' | 'esperando' | 'listo' | 'error' | 'cancelado' | 'rechazado'
 
 export type AgentRow = {
   toolUseId: string
   agentId?: string
+  /** The name the call gave it (`Agent({ name })`), with the team's suffix if it got one. */
+  name?: string
   type: string
   model: string
   description: string
   status: AgentStatus
   lastTool?: string
+  /** The tool whose permission the agent waits on, while `esperando`. */
+  waitingTool?: string
   toolCount: number
   startedAt: number
   endedAt?: number
