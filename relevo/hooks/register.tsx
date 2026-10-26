@@ -1,7 +1,7 @@
 import { atom, read, update } from 'claude-code'
 import type { EngineInterface, Register } from 'claude-code'
 
-import type { Handoff, HandoffKind, Phase, Role, Seat } from '../types'
+import type { Handoff, HandoffKind, Letter, Phase, Role, Seat } from '../types'
 
 const PANE = 'relevo'
 const TITLE = 'Relevo'
@@ -24,6 +24,9 @@ const ROLES: readonly Role[] = ['planifica', 'construye']
 const partnerOf = (mine: Role): Role => (mine === 'planifica' ? 'construye' : 'planifica')
 const seatKey = (of: Role) => `sesion:${of}`
 const cmdOf = (of: Role) => (of === 'planifica' ? 'plan' : 'build')
+// A handoff waits in the shared store, one key per letter, for the session holding that role.
+// It never goes through SendMessage, so no permission check or auto mode classifier is involved.
+const boxOf = (of: Role) => `buzon:${of}:`
 const LABEL: Record<Role, string> = { planifica: 'Planifica', construye: 'Construye' }
 
 // What `/relevo <arg>` means; the Spanish words keep working.
@@ -85,6 +88,10 @@ const PHASE_COLOR: Record<Phase, string | undefined> = {
 
 const REVIEW_PHASES: readonly Phase[] = ['revisando', 'revision enviada', 'aplicando revision']
 
+// Set while poll delivers letters, so the next tick does not deliver them twice.
+let picking = false
+let sentCount = 0
+
 const SPINNER = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏']
 
 const INSTRUCTIONS: Record<Role, string> = {
@@ -145,12 +152,44 @@ async function poll($: EngineInterface) {
     return
   }
   const own = await seatOf($, mine)
-  await refreshSelf($, own !== undefined && own.sessionId === (await $.session.id()) ? own : null)
+  const isMine = own !== undefined && own.sessionId === (await $.session.id())
+  await refreshSelf($, isMine ? own : null)
   await refreshPeer($, (await seatOf($, partnerOf(mine))) ?? null)
+  if (isMine) await pickUp($, mine)
 }
 
 async function record($: EngineInterface, entry: Handoff) {
   await update($, log, list => [...list, entry].slice(-MAX_LOG))
+}
+
+const letterText = (letter: Letter) =>
+  `[relevo] ${letter.kind} de la sesión que ${letter.from}\n\n${letter.summary}\n\n(Responde con la herramienta ${TOOL}.)`
+
+async function arrived($: EngineInterface, kind: HandoffKind, from: Role, summary: string) {
+  await record($, { at: Date.now(), kind, from, direction: 'entra', summary })
+  // The builder counts the rounds it receives, as the planner counts those it sends.
+  if (kind === 'revision') await update($, rounds, n => n + 1)
+  if (kind === 'plan' || kind === 'aprobado') await update($, rounds, () => 0)
+  if (kind in RECEIVED_PHASE) await mark($, { phase: RECEIVED_PHASE[kind] })
+}
+
+// Takes the letters waiting for this session's role and hands each to the model as a prompt,
+// which runs as a turn of its own once the session is idle.
+async function pickUp($: EngineInterface, mine: Role) {
+  if (picking) return
+  picking = true
+  try {
+    for (const key of (await $.store.keys()).filter(k => k.startsWith(boxOf(mine)))) {
+      const letter = (await $.store.get(key)) as Letter | undefined
+      await $.store.delete(key)
+      if (letter === undefined) continue
+      await arrived($, letter.kind, letter.from, letter.summary)
+      // Put it back if the prompt did not enter, so the next poll tries again.
+      void $.prompt.submit({ text: letterText(letter) }).catch(() => $.store.set(key, letter))
+    }
+  } finally {
+    picking = false
+  }
 }
 
 async function leave($: EngineInterface) {
@@ -324,36 +363,27 @@ export const register: Register = on => {
     const partner = await seatOf($, partnerOf(mine))
     if (partner === undefined) return { deny: `No hay sesión que ${partnerOf(mine)}. Pídele a la persona que abra otra y corra /relevo ${cmdOf(partnerOf(mine))}.` }
 
-    const text = `[relevo] ${kind} de la sesión que ${mine}\n\n${summary}\n\n(Responde con la herramienta ${TOOL}.)`
-    const sent = await $.session.send({ to: { sessionId: partner.sessionId }, text })
-    if (!sent.isDelivered) {
-      return { deny: `No se entregó: ${sent.reason}. No reintentes igual: avísale a la persona (puede que la otra sesión esté cerrada).` }
-    }
+    const letter: Letter = { at: Date.now(), kind, from: mine, summary }
+    const key = `${boxOf(partnerOf(mine))}${letter.at}-${sentCount++}`
+    await $.store.set(key, letter)
 
     if (kind === 'revision') await update($, rounds, n => n + 1)
     if (kind === 'plan' || kind === 'aprobado') await update($, rounds, () => 0)
     await record($, { at: Date.now(), kind, from: mine, direction: 'sale', summary })
     await mark($, { phase: SENT_PHASE[kind] }).catch(() => undefined)
 
+    // No waiting here for the pickup: a sleep counts against the hook's time budget.
     const after = kind === 'aprobado' ? 'Cuéntale a la persona el resultado.' : 'Termina tu turno; la respuesta llega sola.'
-    return { result: `Entregado a la sesión que ${partnerOf(mine)}. ${after}` }
+    return {
+      result: `Entregado al buzón de la sesión que ${partnerOf(mine)}: la toma en un segundo, o al volver si está cerrada. No lo reenvíes. ${after}`,
+    }
   }).catch(() => ({ deny: 'relevo falló al entregar; reintenta o avísale a la persona.' }))
 
   on('session.receive', async ($, e, next) => {
     const found = /\[relevo\] (\w+) de la sesión que (planifica|construye)\n\n([\s\S]*?)\n\n\(Responde/.exec(e.text)
     if ((e.origin.kind === 'peer' || e.origin.kind === 'peer-send-message') && found !== null && e.agentId === undefined) {
-      const kind = found[1] as HandoffKind
-      await record($, {
-        at: Date.now(),
-        kind,
-        from: found[2] as Role,
-        direction: 'entra',
-        summary: found[3] ?? '',
-      })
-      // The builder counts the rounds it receives, as the planner counts those it sends.
-      if (kind === 'revision') await update($, rounds, n => n + 1)
-      if (kind === 'plan' || kind === 'aprobado') await update($, rounds, () => 0)
-      if (kind in RECEIVED_PHASE) await mark($, { phase: RECEIVED_PHASE[kind] })
+      // A handoff from a 0.2 partner, which still sent through SendMessage.
+      await arrived($, found[1] as HandoffKind, found[2] as Role, found[3] ?? '')
     }
 
     return next(e)

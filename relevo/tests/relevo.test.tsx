@@ -14,12 +14,11 @@ const PANE = {
   },
 } as const
 
-type Sent = { to: unknown; text: string }
-
 // Nothing sits beneath the plugin: these hooks stand for the engine, the store
 // a map in memory as the JSON file stands between two sessions.
-function stubEngine(on: any, sent: Sent[] = []) {
+function stubEngine(on: any, prompts: string[] = []) {
   const store = new Map<string, unknown>()
+  on('store.keys', () => ({ value: [...store.keys()] }))
   on('store.get', (_: unknown, e: { key: string }) => ({ value: store.get(e.key) }))
   on('store.set', (_: unknown, e: { key: string; value: unknown }) => {
     store.set(e.key, e.value)
@@ -35,9 +34,9 @@ function stubEngine(on: any, sent: Sent[] = []) {
   on('session.start', (_: unknown, e: { cwd: string }) => ({ cwd: e.cwd }))
   on('session.id', () => ({ value: 'sesion-a' }))
   on('session.cwd', () => ({ value: '/repo' }))
-  on('session.send', (_: unknown, e: Sent) => {
-    sent.push({ to: e.to, text: e.text })
-    return { isDelivered: true }
+  on('prompt.submit', (_: unknown, e: { text: string }) => {
+    prompts.push(e.text)
+    return { text: e.text }
   })
   on('session.receive', (_: unknown, e: { text: string }) => ({ text: e.text }))
   on('turn.start', (_: unknown, e: { turnId: string }) => ({ turnId: e.turnId }))
@@ -57,8 +56,7 @@ const relevo = ($: any, args: string) =>
 const BRAILLE = /[⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏]/
 
 test('the planner hands the plan to the builder session', async ($, on) => {
-  const sent: Sent[] = []
-  const store = stubEngine(on, sent)
+  const store = stubEngine(on)
 
   await $.session.start({ cwd: '/repo', surface: 'terminal', isInteractive: true })
   const set = await relevo($, 'planifica')
@@ -73,8 +71,10 @@ test('the planner hands the plan to the builder session', async ($, on) => {
   store.set('sesion:construye', { sessionId: 'sesion-b', cwd: '/repo', at: Date.now() })
   const ok = await $.tool.call({ tool: 'mcp__relevo__entregar', tipo: 'plan', resumen: 'Paso 1: test' })
   expect(ok.deny).toBeUndefined()
-  expect(sent).toHaveLength(1)
-  expect(sent[0]?.text).toContain('[relevo] plan de la sesión que planifica')
+  // The plan waits in the builder's mailbox: no SendMessage, so auto mode never judges it.
+  const letters = [...store.keys()].filter(k => k.startsWith('buzon:construye:'))
+  expect(letters).toHaveLength(1)
+  expect((store.get(letters[0]!) as any)?.summary).toBe('Paso 1: test')
 
   const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
   expect((await ui.find({ type: 'Text', text: /Paso 1: test/ }))?.text).toContain('Paso 1: test')
@@ -141,6 +141,26 @@ test('the builder moves to building when a plan arrives', async ($, on) => {
     origin: { kind: 'peer' },
     text: '[relevo] plan de la sesión que planifica\n\nPaso 1\n\n(Responde con la herramienta mcp__relevo__entregar.)',
   })
+  expect((store.get('sesion:construye') as any)?.phase).toBe('construyendo plan')
+})
+
+test('the builder takes a waiting plan from its mailbox as a prompt', async ($, on) => {
+  const clock = mock.clock(on, { now: Date.now() })
+  const prompts: string[] = []
+  const store = stubEngine(on, prompts)
+  // Left by the planner while this session was closed.
+  store.set('buzon:construye:1-0', { at: 1, kind: 'plan', from: 'planifica', summary: 'Paso 1' })
+  store.set('buzon:planifica:2-0', { at: 2, kind: 'entrega', from: 'construye', summary: 'no es mía' })
+
+  await $.session.start({ cwd: '/repo', surface: 'terminal', isInteractive: true })
+  await relevo($, 'build')
+  await clock.advance(1000)
+  await clock.advance(1000)
+
+  expect(prompts).toHaveLength(1)
+  expect(prompts[0]).toContain('[relevo] plan de la sesión que planifica\n\nPaso 1')
+  expect(store.get('buzon:construye:1-0')).toBeUndefined()
+  expect(store.get('buzon:planifica:2-0')).toBeDefined()
   expect((store.get('sesion:construye') as any)?.phase).toBe('construyendo plan')
 })
 

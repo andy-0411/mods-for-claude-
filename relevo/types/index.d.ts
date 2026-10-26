@@ -10,6 +10,9 @@ export type Handoff = {
   summary: string
 }
 
+// A handoff waiting in the shared store under `buzon:<role>:<id>` for the session holding that role.
+export type Letter = { at: number; kind: HandoffKind; from: Role; summary: string }
+
 export type Phase =
   | 'listo' // planifica: rol tomado, sin plan aún
   | 'planificando' // planifica: turno corriendo sin haber enviado plan
