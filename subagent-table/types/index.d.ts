@@ -1,0 +1,27 @@
+export type AgentStatus = 'arrancando' | 'corriendo' | 'listo' | 'error' | 'cancelado' | 'rechazado'
+
+export type AgentRow = {
+  toolUseId: string
+  agentId?: string
+  type: string
+  model: string
+  description: string
+  status: AgentStatus
+  lastTool?: string
+  toolCount: number
+  startedAt: number
+  endedAt?: number
+  /** Model requests the agent made (one per `turn.step` with usage). */
+  requests: number
+  /** Fresh input tokens: uncached input plus what was written to the cache. */
+  tokensIn: number
+  tokensOut: number
+  /** Input tokens served from the prompt cache (cheap, counted apart). */
+  tokensCached: number
+}
+
+declare module 'claude-code' {
+  interface PluginState {
+    'subagent-table': { agents: AgentRow[]; now: number }
+  }
+}
