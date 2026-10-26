@@ -202,3 +202,38 @@ test('a named subagent shows its name as the title, the task under it', async ($
     await ui.unmount()
   }
 })
+
+test('a tool that throws after the wait leaves the card working, the error going up', async ($, on) => {
+  on('command.register', () => ({ value: { command: 'subagentes' } }))
+  on('ui.open', () => ({ value: { isPlaced: true } }))
+  on('ui.status', () => ({ value: undefined }))
+  on('session.start', (_, e) => ({ cwd: e.cwd }))
+  on('agent.spawn', () => ({ model: 'claude-sonnet-5-5', agentId: 'a1' }))
+  on('tool.check', () => ({ decision: 'ask' }))
+  let waited: string | undefined
+  on('classic.PermissionRequest', async () => {
+    const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+    waited = (await ui.find({ type: 'Text', text: /esperando permiso/ }))?.text
+    await ui.unmount()
+    return { decision: { behavior: 'allow' } }
+  })
+  on('tool.call', () => {
+    throw new Error('x')
+  })
+
+  await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
+  await $.agent.spawn({ ...SPAWN, prompt: 'Corre ls', description: 'Correr ls', subagentType: 'Explore' })
+  // The engine skips the throwing hook: nothing is left to run the tool, and the call rejects.
+  const failure = await $.tool.call({ tool: 'Bash', command: 'ls', agentId: 'a1' }).then(
+    () => undefined,
+    (error: unknown) => String(error),
+  )
+  expect(waited).toBe(' ⏸ esperando permiso · Bash')
+  expect(failure).toMatch(/tool\.call/)
+
+  for (const surface of ['terminal', 'desktop'] as const) {
+    const ui = await $.ui.mount({ ...PANE, surface })
+    expect((await ui.find({ type: 'Text', text: /● trabajando/ }))?.text).toBe(' ● trabajando · Bash')
+    await ui.unmount()
+  }
+})
