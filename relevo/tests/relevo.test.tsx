@@ -81,7 +81,7 @@ test('the planner hands the plan to the builder session', async ($, on) => {
   await ui.unmount()
 })
 
-test('revisions stop after three rounds', async ($, on) => {
+test('failure reports stop after three rounds', async ($, on) => {
   const store = stubEngine(on)
 
   await $.session.start({ cwd: '/repo', surface: 'terminal', isInteractive: true })
@@ -89,10 +89,10 @@ test('revisions stop after three rounds', async ($, on) => {
   store.set('sesion:construye', { sessionId: 'sesion-b', cwd: '/repo', at: Date.now() })
 
   for (let i = 0; i < 3; i++) {
-    const round = await $.tool.call({ tool: 'mcp__relevo__entregar', tipo: 'revision', resumen: `falta ${i}` })
+    const round = await $.tool.call({ tool: 'mcp__relevo__entregar', tipo: 'fallo', resumen: `falta ${i}` })
     expect(round.deny).toBeUndefined()
   }
-  const fourth = await $.tool.call({ tool: 'mcp__relevo__entregar', tipo: 'revision', resumen: 'otra' })
+  const fourth = await $.tool.call({ tool: 'mcp__relevo__entregar', tipo: 'fallo', resumen: 'otra' })
   expect(fourth.deny).toContain('pregúntale a la persona')
 })
 
@@ -236,4 +236,37 @@ test('the transcript shows one line per handoff', async ($, on) => {
   expect(await call.find({ type: 'Text', text: /entregado a la sesión que planifica/ })).toBeDefined()
   expect(await call.find({ type: 'Text', text: /Cambié 4 archivos/ })).toBeUndefined()
   await call.unmount()
+})
+
+test('an approval reaches the builder pane without opening a turn', async ($, on) => {
+  const clock = mock.clock(on, { now: Date.now() })
+  const prompts: string[] = []
+  const store = stubEngine(on, prompts)
+  store.set('buzon:construye:1-0', { at: 1, kind: 'aprobado', from: 'planifica', summary: 'Todo cumple' })
+
+  await $.session.start({ cwd: '/repo', surface: 'terminal', isInteractive: true })
+  await relevo($, 'build')
+  await clock.advance(1000)
+
+  expect(prompts).toHaveLength(0)
+  expect(store.get('buzon:construye:1-0')).toBeUndefined()
+  expect((store.get('sesion:construye') as any)?.phase).toBe('aprobado')
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  expect(await ui.find({ type: 'Text', text: /Todo cumple/ })).toBeDefined()
+  await ui.unmount()
+})
+
+test('a failure report wakes the builder with only what failed', async ($, on) => {
+  const clock = mock.clock(on, { now: Date.now() })
+  const prompts: string[] = []
+  const store = stubEngine(on, prompts)
+  store.set('buzon:construye:1-0', { at: 1, kind: 'fallo', from: 'planifica', summary: 'a.ts:3 no exporta x' })
+
+  await $.session.start({ cwd: '/repo', surface: 'terminal', isInteractive: true })
+  await relevo($, 'build')
+  await clock.advance(1000)
+
+  expect(prompts).toHaveLength(1)
+  expect(prompts[0]).toContain('[relevo] fallo de la sesión que planifica\n\na.ts:3 no exporta x')
+  expect((store.get('sesion:construye') as any)?.phase).toBe('corrigiendo fallo')
 })

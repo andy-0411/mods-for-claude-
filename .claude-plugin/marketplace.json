@@ -12,7 +12,7 @@
     {
       "name": "relevo",
       "source": "./relevo",
-      "description": "Dos sesiones de Claude se pasan el trabajo: una planifica y revisa, la otra construye"
+      "description": "Dos sesiones de Claude se pasan el trabajo: una planifica y prueba el plan, la otra construye y corre las pruebas técnicas"
     }
   ]
 }
