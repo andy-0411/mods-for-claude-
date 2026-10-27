@@ -38,14 +38,14 @@ const ALIASES: Record<string, string> = {
 }
 
 const KINDS: Record<Role, readonly HandoffKind[]> = {
-  planifica: ['plan', 'revision', 'respuesta', 'aprobado'],
+  planifica: ['plan', 'fallo', 'respuesta', 'aprobado'],
   construye: ['entrega', 'pregunta'],
 }
 
 const KIND_COLOR: Record<HandoffKind, string | undefined> = {
   plan: 'suggestion',
   entrega: 'warning',
-  revision: 'error',
+  fallo: 'error',
   pregunta: 'warning',
   respuesta: undefined,
   aprobado: 'success',
@@ -56,7 +56,7 @@ const FIRST_PHASE: Record<Role, Phase> = { planifica: 'listo', construye: 'esper
 // The phase a session moves to when it sends a handoff, and when it receives one.
 const SENT_PHASE: Record<HandoffKind, Phase> = {
   plan: 'plan creado',
-  revision: 'revision enviada',
+  fallo: 'fallo enviado',
   respuesta: 'respuesta enviada',
   aprobado: 'aprobado',
   entrega: 'entregado',
@@ -66,7 +66,7 @@ const RECEIVED_PHASE: Record<HandoffKind, Phase> = {
   entrega: 'revisando',
   pregunta: 'revisando',
   plan: 'construyendo plan',
-  revision: 'aplicando revision',
+  fallo: 'corrigiendo fallo',
   respuesta: 'construyendo plan',
   aprobado: 'aprobado',
 }
@@ -76,17 +76,19 @@ const PHASE_COLOR: Record<Phase, string | undefined> = {
   'esperando plan': undefined,
   planificando: 'suggestion',
   'construyendo plan': 'suggestion',
-  'aplicando revision': 'suggestion',
+  'corrigiendo fallo': 'suggestion',
   revisando: 'suggestion',
   'plan creado': 'warning',
   entregado: 'warning',
-  'revision enviada': 'warning',
+  'fallo enviado': 'warning',
   'respuesta enviada': 'warning',
   'pregunta enviada': 'warning',
   aprobado: 'success',
 }
 
-const REVIEW_PHASES: readonly Phase[] = ['revisando', 'revision enviada', 'aplicando revision']
+const REVIEW_PHASES: readonly Phase[] = ['revisando', 'fallo enviado', 'corrigiendo fallo']
+// Kinds that close the work: the receiver sees them in its pane, and no turn is spent on them.
+const QUIET: readonly HandoffKind[] = ['aprobado']
 
 // Set while poll delivers letters, so the next tick does not deliver them twice.
 let picking = false
@@ -98,18 +100,19 @@ const INSTRUCTIONS: Record<Role, string> = {
   planifica: [
     '# Relevo: esta sesión PLANIFICA',
     'Trabajas en pareja con otra sesión de Claude que construye. Tú no implementas código del proyecto.',
-    `1. Entiende el pedido, explora el código y escribe el plan en \`${PLAN_FILE}\`: pasos verificables, archivos a tocar, el comando que prueba cada paso y el criterio de terminado.`,
-    `2. Cuando el plan esté listo, llama \`${TOOL}\` con tipo "plan" y un resumen. Luego termina tu turno: la respuesta del constructor te llega sola.`,
-    '3. Al recibir una "entrega", revisa el trabajo contra el plan (git diff, corre los tests). Si cumple, entrega "aprobado" y avísale a la persona. Si no, entrega "revision" con lo que falta, concreto y con archivo:línea.',
-    `4. A una "pregunta" contesta con "respuesta". Tras ${MAX_ROUNDS} rondas de revisión sin aprobar, detente y pregúntale a la persona.`,
+    'Reparto de pruebas: la que construye solo corre pruebas técnicas (tests, tipos, build: que el código funcione sin errores). Tú corres las pruebas del plan: que quedó lo que se pidió. Ninguna repite las pruebas de la otra.',
+    `1. Explora el código y escribe el plan en \`${PLAN_FILE}\`: pasos, archivos a tocar, la prueba técnica de cada paso (para la que construye) y una sección "Pruebas del plan" con lo que tú vas a comprobar al final. Si la tarea es una consulta o un solo paso, no escribas el archivo: el resumen es el plan.`,
+    `2. Llama \`${TOOL}\` con tipo "plan". El resumen no copia el archivo: dos o tres líneas y la ruta. Luego termina tu turno.`,
+    '3. Al recibir la "entrega", corre solo tus pruebas del plan; no vuelvas a correr las técnicas que ya pasaron. Si todo cumple, entrega "aprobado" (a la otra sesión no se le abre un turno) y cuéntale el resultado a la persona.',
+    `4. Si algo no cumple, entrega un solo "fallo": cada cosa que falló, con archivo:línea, la prueba y lo que salió, sin repetir el plan ni lo que sí pasó. Tras ${MAX_ROUNDS} fallos sin aprobar, detente y pregúntale a la persona. A una "pregunta" contesta con "respuesta".`,
   ].join('\n'),
   construye: [
     '# Relevo: esta sesión CONSTRUYE',
-    'Trabajas en pareja con otra sesión de Claude que planifica y revisa.',
-    `1. Espera el "plan". Al recibirlo, lee \`${PLAN_FILE}\` e impleméntalo paso a paso, verificando cada paso con el comando que indica.`,
-    `2. Al terminar, llama \`${TOOL}\` con tipo "entrega": qué cambiaste (archivos), qué verificaste y el resultado. Luego termina tu turno.`,
-    '3. Si el plan es ambiguo o choca con el código, entrega "pregunta" en vez de inventar, y espera la respuesta.',
-    '4. Una "revision" trae correcciones: aplícalas y vuelve a entregar. No hagas commits salvo que el plan lo pida.',
+    'Trabajas en pareja con otra sesión de Claude que planifica y comprueba que quedó lo que se pidió.',
+    `1. Al recibir el "plan", lee \`${PLAN_FILE}\` si lo hay e impleméntalo. Tú solo corres las pruebas técnicas de cada paso: tests, tipos, build, que no haya errores de código. Las "Pruebas del plan" son de la otra sesión; no las corras.`,
+    '2. Si una prueba técnica falla, arréglala tú antes de entregar; no le pases fallos técnicos a la otra sesión.',
+    `3. Al terminar, llama \`${TOOL}\` con tipo "entrega", una sola vez y corta: archivos que cambiaste y el resultado de las pruebas técnicas, en pocas líneas. Luego termina tu turno; si todo cumple, la otra sesión lo aprueba sin escribirte.`,
+    '4. Si el plan es ambiguo o choca con el código, entrega "pregunta" en vez de inventar. Un "fallo" trae lo que no cumplió: corrígelo, corre las pruebas técnicas y vuelve a entregar solo lo que cambiaste. No hagas commits salvo que el plan lo pida.',
   ].join('\n'),
 }
 
@@ -168,7 +171,7 @@ const letterText = (letter: Letter) =>
 async function arrived($: EngineInterface, kind: HandoffKind, from: Role, summary: string) {
   await record($, { at: Date.now(), kind, from, direction: 'entra', summary })
   // The builder counts the rounds it receives, as the planner counts those it sends.
-  if (kind === 'revision') await update($, rounds, n => n + 1)
+  if (kind === 'fallo') await update($, rounds, n => n + 1)
   if (kind === 'plan' || kind === 'aprobado') await update($, rounds, () => 0)
   if (kind in RECEIVED_PHASE) await mark($, { phase: RECEIVED_PHASE[kind] })
 }
@@ -184,6 +187,7 @@ async function pickUp($: EngineInterface, mine: Role) {
       await $.store.delete(key)
       if (letter === undefined) continue
       await arrived($, letter.kind, letter.from, letter.summary)
+      if (QUIET.includes(letter.kind)) continue
       // Put it back if the prompt did not enter, so the next poll tries again.
       void $.prompt.submit({ text: letterText(letter) }).catch(() => $.store.set(key, letter))
     }
@@ -251,11 +255,11 @@ export const register: Register = on => {
       name: 'entregar',
       description:
         'Pasa el trabajo a la otra sesión de la pareja de relevo (la que planifica o la que construye). ' +
-        'El planificador entrega plan, revision, respuesta o aprobado; el constructor entrega entrega o pregunta.',
+        'El planificador entrega plan, fallo, respuesta o aprobado; el constructor entrega entrega o pregunta.',
       inputSchema: {
         type: 'object',
         properties: {
-          tipo: { type: 'string', enum: ['plan', 'entrega', 'revision', 'pregunta', 'respuesta', 'aprobado'] },
+          tipo: { type: 'string', enum: ['plan', 'entrega', 'fallo', 'pregunta', 'respuesta', 'aprobado'] },
           resumen: { type: 'string', description: 'Lo que la otra sesión necesita saber para seguir, autocontenido.' },
         },
         required: ['tipo', 'resumen'],
@@ -356,8 +360,8 @@ export const register: Register = on => {
     if (summary === '') return { deny: 'Falta el resumen.' }
 
     const done = await read($, rounds)
-    if (kind === 'revision' && done >= MAX_ROUNDS) {
-      return { deny: `Ya van ${MAX_ROUNDS} rondas de revisión sin aprobar. Detente y pregúntale a la persona cómo seguir.` }
+    if (kind === 'fallo' && done >= MAX_ROUNDS) {
+      return { deny: `Ya van ${MAX_ROUNDS} fallos sin aprobar. Detente y pregúntale a la persona cómo seguir.` }
     }
 
     const partner = await seatOf($, partnerOf(mine))
@@ -367,15 +371,17 @@ export const register: Register = on => {
     const key = `${boxOf(partnerOf(mine))}${letter.at}-${sentCount++}`
     await $.store.set(key, letter)
 
-    if (kind === 'revision') await update($, rounds, n => n + 1)
+    if (kind === 'fallo') await update($, rounds, n => n + 1)
     if (kind === 'plan' || kind === 'aprobado') await update($, rounds, () => 0)
     await record($, { at: Date.now(), kind, from: mine, direction: 'sale', summary })
     await mark($, { phase: SENT_PHASE[kind] }).catch(() => undefined)
 
     // No waiting here for the pickup: a sleep counts against the hook's time budget.
-    const after = kind === 'aprobado' ? 'Cuéntale a la persona el resultado.' : 'Termina tu turno; la respuesta llega sola.'
+    if (kind === 'aprobado') {
+      return { result: `Aprobado. La sesión que ${partnerOf(mine)} lo ve en su panel, sin abrir un turno. Cuéntale a la persona el resultado.` }
+    }
     return {
-      result: `Entregado al buzón de la sesión que ${partnerOf(mine)}: la toma en un segundo, o al volver si está cerrada. No lo reenvíes. ${after}`,
+      result: `Entregado al buzón de la sesión que ${partnerOf(mine)}: la toma en un segundo, o al volver si está cerrada. No lo reenvíes. Termina tu turno; la respuesta llega sola.`,
     }
   }).catch(() => ({ deny: 'relevo falló al entregar; reintenta o avísale a la persona.' }))
 
@@ -482,7 +488,7 @@ export const register: Register = on => {
         {card('construye')}
         {showRounds && (
           <Text>
-            <Text dimColor>  revisiones </Text>
+            <Text dimColor>  fallos </Text>
             <Text color="warning">{'●'.repeat(Math.min(done, MAX_ROUNDS))}</Text>
             <Text dimColor>{'○'.repeat(Math.max(0, MAX_ROUNDS - done))}  {done}/{MAX_ROUNDS}</Text>
           </Text>

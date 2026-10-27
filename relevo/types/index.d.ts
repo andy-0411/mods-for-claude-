@@ -1,6 +1,6 @@
 export type Role = 'planifica' | 'construye'
 
-export type HandoffKind = 'plan' | 'entrega' | 'revision' | 'pregunta' | 'respuesta' | 'aprobado'
+export type HandoffKind = 'plan' | 'entrega' | 'fallo' | 'pregunta' | 'respuesta' | 'aprobado'
 
 export type Handoff = {
   at: number
@@ -18,13 +18,13 @@ export type Phase =
   | 'planificando' // planifica: turno corriendo sin haber enviado plan
   | 'plan creado' // planifica: envió plan, espera entrega
   | 'revisando' // planifica: recibió entrega/pregunta
-  | 'revision enviada'
+  | 'fallo enviado'
   | 'respuesta enviada'
   | 'aprobado'
   | 'esperando plan' // construye: rol tomado, nada recibido
   | 'construyendo plan' // construye: recibió plan
-  | 'aplicando revision'
-  | 'entregado' // construye: envió entrega, espera revisión
+  | 'corrigiendo fallo'
+  | 'entregado' // construye: envió entrega, espera las pruebas del plan
   | 'pregunta enviada'
 
 // What each session writes to the shared store under `sesion:<role>`.
